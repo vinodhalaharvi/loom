@@ -5,9 +5,11 @@ agent execution engine. loom listens to Slack over a Socket Mode WebSocket,
 turns each event into a typed value, runs a handler, and posts the result
 back. It weaves the threads of Slack activity into durable agent execution.
 
-> **Status:** PR-1 — Socket Mode listener + echo handler. No Sibyl
-> dependency yet; that arrives in PR-2, where the handler submits a durable
-> workflow instead of echoing.
+> **Status:** PR-2 — Sibyl-backed handler. A Slack mention/message starts a
+> Sibyl `ConvergeWorkflow`; the answer is posted back to the originating
+> thread when the workflow completes (the B1 correlation model: start fast,
+> await in the background, post on completion). Requires a running Temporal
+> cluster and Sibyl worker.
 
 ## The idea
 
@@ -113,20 +115,34 @@ text back in-thread.
 
 ```
 loom/
-├── cmd/loom/main.go   # entry point: reads tokens, runs the listener
-├── types.go           # Event, Context, Reply, Handler — the mapping
-├── translate.go       # Slack event → loom.Event (the ingress half)
-├── listener.go        # Socket Mode connection, ack, bounded dispatch
-├── render.go          # Reply → Slack API calls (the one effectful edge)
-├── handler.go         # EchoHandler (replaced by a Sibyl handler in PR-2)
-└── loom_test.go       # translate / handler / Reply tests
+├── cmd/loom/main.go    # entry point: tokens + Temporal config, wires the handler
+├── types.go            # Event, Context, Reply, Handler — the mapping
+├── translate.go        # Slack event → loom.Event (the ingress half)
+├── listener.go         # Socket Mode connection, ack, bounded dispatch
+├── render.go           # Reply → Slack API calls (the one effectful edge)
+├── correlation.go      # ThreadID ↔ WorkflowID table (B1)
+├── sibyl.go            # the invoke seam: Start / Await + async runner
+├── sibyl_handler.go    # SibylHandler: event → Question → workflow
+├── handler.go          # EchoHandler (PR-1; kept for reference/testing)
+└── *_test.go           # translate / handler / correlation / runner tests
 ```
 
 ## Roadmap
 
-- **PR-1 (this):** Socket Mode listener, typed event mapping, echo handler.
-- **PR-2:** depend on Sibyl; `invoke` submits a workflow via a Temporal
-  client; `MissingCredentialError` → a "🔑 Authorize" reply.
-- **Later:** thread ↔ workflow correlation, channel-scoped agent
-  availability ("roles via channels"), file handling, Slack-ID → canonical
-  identity mapping.
+- **PR-1:** Socket Mode listener, typed event mapping, echo handler.
+- **PR-2 (this):** depend on Sibyl; `invoke` starts a `ConvergeWorkflow`
+  via a Temporal client and posts the answer back to the thread when it
+  completes (B1 correlation: `Start` → record in the correlation table →
+  background `Await` → post). Sibyl is unchanged.
+- **Later:**
+  - **Auth button.** Translate a workflow's missing-credential failure into
+    a "🔑 Authorize" reply. Deferred because `ConvergeWorkflow` doesn't use
+    per-agent OAuth, so nothing raises `MissingCredentialError` on this path
+    yet — and that error crosses the Temporal boundary as a generic
+    `ApplicationError`, so detecting it cleanly needs a small Sibyl-side
+    change (typed `ApplicationError`) paired with the loom translation. A
+    focused PR when loom drives an OAuth-using agent.
+  - Multi-turn thread continuity (route a human's follow-up reply into the
+    existing workflow via the correlation table).
+  - Channel-scoped agent availability ("roles via channels").
+  - File handling; Slack-ID → canonical identity mapping.
