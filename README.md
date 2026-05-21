@@ -5,11 +5,11 @@ agent execution engine. loom listens to Slack over a Socket Mode WebSocket,
 turns each event into a typed value, runs a handler, and posts the result
 back. It weaves the threads of Slack activity into durable agent execution.
 
-> **Status:** PR-2 — Sibyl-backed handler. A Slack mention/message starts a
-> Sibyl `ConvergeWorkflow`; the answer is posted back to the originating
-> thread when the workflow completes (the B1 correlation model: start fast,
-> await in the background, post on completion). Requires a running Temporal
-> cluster and Sibyl worker.
+> **Status:** PR-3 — the full loop. A Slack message is translated to
+> AgentScript by an LLM, compiled to a Sibyl execution Plan (the compiler
+> validates it — invalid commands are rejected, never executed), and run
+> as a durable `PlanWorkflow`; the result is posted back to the thread.
+> Requires a Temporal cluster, a Sibyl worker, and `ANTHROPIC_API_KEY`.
 
 ## The idea
 
@@ -30,30 +30,37 @@ and Sibyl results into Slack replies. It never holds a vendor credential.
 ```mermaid
 flowchart TD
     subgraph slack["Slack"]
-        evt["message · @mention · /command<br/>· reaction · file"]
-        reply["reply: text · files · reactions<br/>· 🔑 auth button"]
+        evt["message · @mention · /command"]
+        reply["reply: result · 'working…' · rejection"]
     end
 
     subgraph loom["loom — Arrow[Event, Reply]"]
         ws["Socket Mode WebSocket<br/>(outbound; no public URL)"]
         ack["ack within 3s"]
-        tr["translate → Event<br/>{Context, Kind, Text, Files}"]
-        h["handler"]
+        tr["translate → Event"]
+        llm["Translator (LLM)<br/>prose → AgentScript DSL"]
         rn["render → Slack API"]
     end
 
-    subgraph sibyl["Sibyl (PR-2+, unchanged)"]
-        inv["submit workflow"]
-        oauth["WithOAuth → per-user token"]
-        work["durable workflow"]
+    subgraph as["AgentScript (pkg/script)"]
+        compile["Compile: Parse→Resolve→Lower<br/>→Finalize→Validate"]
+        plan["validated Plan<br/>(rejects unknown/bad commands)"]
     end
 
-    evt --> ws --> ack --> tr --> h
-    h -->|PR-1: echo| rn
-    h -.->|PR-2: invoke| inv --> oauth --> work
-    work -.->|results / HITL via<br/>Sibyl channels/slack| reply
+    subgraph sibyl["Sibyl"]
+        submit["Submit → PlanWorkflow"]
+        work["durable execution<br/>(named activities)"]
+    end
+
+    evt --> ws --> ack --> tr --> llm --> compile --> plan --> submit --> work
+    compile -.->|invalid DSL| reply
+    work -.->|PlanResult| reply
     rn --> reply
 ```
+
+The compiler is the safety net: an LLM that emits an unknown command or
+bad arguments fails at `Compile`, and loom replies with a friendly
+"I couldn't turn that into a valid command" — nothing wrong executes.
 
 Two directions touch Slack, and they live in different repos on purpose:
 
@@ -93,7 +100,11 @@ loom needs two tokens and Socket Mode enabled on your Slack app:
 ```bash
 export SLACK_BOT_TOKEN="xoxb-..."   # Web API: post, react, user info
 export SLACK_APP_TOKEN="xapp-..."   # Socket Mode: connections:write
+export ANTHROPIC_API_KEY="..."      # LLM for prose → AgentScript DSL
 
+# end-to-end execution also needs a Temporal cluster + Sibyl worker:
+#   temporal server start-dev
+#   go run ./cmd/worker   (in the sibyl repo)
 go run ./cmd/loom
 ```
 
@@ -115,34 +126,38 @@ text back in-thread.
 
 ```
 loom/
-├── cmd/loom/main.go    # entry point: tokens + Temporal config, wires the handler
+├── cmd/loom/main.go    # entry point: tokens + LLM + Temporal, wires the handler
 ├── types.go            # Event, Context, Reply, Handler — the mapping
 ├── translate.go        # Slack event → loom.Event (the ingress half)
 ├── listener.go         # Socket Mode connection, ack, bounded dispatch
 ├── render.go           # Reply → Slack API calls (the one effectful edge)
+├── translator.go       # prose → AgentScript DSL (LLM) + conservative prompt
 ├── correlation.go      # ThreadID ↔ WorkflowID table (B1)
-├── sibyl.go            # the invoke seam: Start / Await + async runner
-├── sibyl_handler.go    # SibylHandler: event → Question → workflow
+├── sibyl.go            # PlanClient seam: Start / Await + async runner
+├── sibyl_handler.go    # ScriptHandler: prose → compile → submit
 ├── handler.go          # EchoHandler (PR-1; kept for reference/testing)
-└── *_test.go           # translate / handler / correlation / runner tests
+└── *_test.go           # translate / translator / handler / correlation tests
 ```
 
 ## Roadmap
 
 - **PR-1:** Socket Mode listener, typed event mapping, echo handler.
-- **PR-2 (this):** depend on Sibyl; `invoke` starts a `ConvergeWorkflow`
-  via a Temporal client and posts the answer back to the thread when it
-  completes (B1 correlation: `Start` → record in the correlation table →
-  background `Await` → post). Sibyl is unchanged.
+- **PR-2:** depend on Sibyl; B1 correlation — start a workflow, record
+  thread↔workflow, background-await, post the result.
+- **PR-3 (this):** the full loop. Depend on AgentScript's `pkg/script`;
+  an LLM translates the Slack message to AgentScript DSL; `script.Compile`
+  validates it (unknown/malformed commands are rejected, never executed);
+  `script.Submit` runs it as a durable Sibyl `PlanWorkflow`; the result is
+  posted back to the thread. The composition lives in the DSL — the LLM is
+  its author, the compiler its safety net.
 - **Later:**
-  - **Auth button.** Translate a workflow's missing-credential failure into
-    a "🔑 Authorize" reply. Deferred because `ConvergeWorkflow` doesn't use
-    per-agent OAuth, so nothing raises `MissingCredentialError` on this path
-    yet — and that error crosses the Temporal boundary as a generic
-    `ApplicationError`, so detecting it cleanly needs a small Sibyl-side
-    change (typed `ApplicationError`) paired with the loom translation. A
-    focused PR when loom drives an OAuth-using agent.
-  - Multi-turn thread continuity (route a human's follow-up reply into the
-    existing workflow via the correlation table).
-  - Channel-scoped agent availability ("roles via channels").
+  - More builtins beyond `echo` (each = one registry entry in AgentScript
+    + one registered Sibyl activity).
+  - **Auth button.** A workflow's missing-credential failure → a
+    "🔑 Authorize" reply. Needs a small Sibyl-side change (typed
+    `ApplicationError`) paired with the loom translation; a focused PR when
+    loom drives an OAuth-using activity.
+  - Multi-turn thread continuity (route a follow-up reply into the existing
+    workflow via the correlation table).
+  - Channel-scoped command availability ("roles via channels").
   - File handling; Slack-ID → canonical identity mapping.
