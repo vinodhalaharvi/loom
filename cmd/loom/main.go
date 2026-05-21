@@ -1,29 +1,31 @@
 // Command loom runs the Slack front end: it opens a Socket Mode
-// WebSocket to Slack and routes events into Sibyl.
+// WebSocket to Slack and routes events into Sibyl via AgentScript.
 //
-// PR-2 wires the SibylHandler — a Slack mention/message/slash-command
-// starts a Sibyl ConvergeWorkflow, and the answer is posted back to the
-// originating thread when the workflow completes (the B1 correlation
-// model: start fast, await in the background, post on completion).
+// The pipeline (PR-3):
+//
+//	Slack message (prose)
+//	  → Translator (LLM) emits AgentScript DSL
+//	  → script.Compile validates it (rejects unknown/bad commands safely)
+//	  → script.Submit runs it as a durable Sibyl PlanWorkflow
+//	  → the result is posted back to the thread (B1 correlation)
 //
 // Required environment:
 //
-//	SLACK_BOT_TOKEN   xoxb-...   (Web API: post, react, user info)
-//	SLACK_APP_TOKEN   xapp-...   (Socket Mode: connections:write)
+//	SLACK_BOT_TOKEN    xoxb-...   (Web API: post, react)
+//	SLACK_APP_TOKEN    xapp-...   (Socket Mode: connections:write)
+//	ANTHROPIC_API_KEY  the LLM key for prose→DSL translation
 //
 // Optional environment:
 //
-//	TEMPORAL_HOSTPORT   Temporal frontend address (default: 127.0.0.1:7233)
-//	SIBYL_TASK_QUEUE    task queue the Sibyl worker listens on (default: sibyl-agents)
-//	LOOM_MAX_ROUNDS     convergence round cap (default: 3)
-//	LOOM_DEBUG          set to enable verbose slack-go logging
+//	TEMPORAL_HOSTPORT  Temporal frontend (default 127.0.0.1:7233)
+//	SIBYL_TASK_QUEUE   worker task queue (default sibyl-agents)
+//	LOOM_DEBUG         verbose slack-go logging
 //
-// A running Temporal cluster and a Sibyl worker are required for the
-// workflow to actually execute:
+// Running end-to-end needs Temporal + a Sibyl worker:
 //
-//	temporal server start-dev          # one terminal
-//	go run ./cmd/worker                # in the sibyl repo, another terminal
-//	go run ./cmd/loom                  # here
+//	temporal server start-dev
+//	go run ./cmd/worker          # sibyl repo
+//	go run ./cmd/loom            # here
 package main
 
 import (
@@ -31,8 +33,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
+
+	sibyl "github.com/vinodhalaharvi/sibyl/agent"
+
+	"github.com/vinodhalaharvi/agentscript/pkg/script"
 
 	"github.com/vinodhalaharvi/loom"
 )
@@ -44,25 +49,37 @@ func main() {
 		log.Fatal("loom: set SLACK_BOT_TOKEN (xoxb-) and SLACK_APP_TOKEN (xapp-)")
 	}
 
-	// Dial Sibyl's execution layer via Temporal.
-	sibylClient, err := loom.NewTemporalSibyl(
+	// LLM for prose→DSL translation. Reuses Sibyl's Anthropic client,
+	// which reads ANTHROPIC_API_KEY.
+	llm, err := sibyl.NewAnthropicClient(sibyl.AnthropicConfig{})
+	if err != nil {
+		log.Fatalf("loom: LLM setup: %v (set ANTHROPIC_API_KEY)", err)
+	}
+
+	// The builtin registry drives both the translator's prompt (which
+	// commands the LLM may use) and compilation (which it validates
+	// against). One registry, one source of truth.
+	reg := script.DefaultRegistry()
+	translator := loom.NewTranslator(llm.Complete, reg)
+
+	// Sibyl execution seam.
+	plans, err := loom.NewTemporalPlanClient(
 		os.Getenv("TEMPORAL_HOSTPORT"),
 		os.Getenv("SIBYL_TASK_QUEUE"),
 	)
 	if err != nil {
 		log.Fatalf("loom: %v", err)
 	}
-	defer sibylClient.Close()
+	defer plans.Close()
 
-	// Shared correlation table + renderer for asynchronous result delivery.
 	corr := loom.NewCorrelation()
 	renderer := loom.NewRenderer(botToken)
 
-	handler := loom.NewSibylHandler(loom.SibylHandlerConfig{
-		Sibyl:       sibylClient,
+	handler := loom.NewScriptHandler(loom.ScriptHandlerConfig{
+		Translator:  translator,
+		Plans:       plans,
 		Correlation: corr,
 		Renderer:    renderer,
-		MaxRounds:   envInt("LOOM_MAX_ROUNDS", 3),
 	})
 
 	listener, err := loom.NewListener(loom.Options{
@@ -83,13 +100,4 @@ func main() {
 		log.Fatalf("loom: listener stopped: %v", err)
 	}
 	log.Println("loom: shut down")
-}
-
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return def
 }

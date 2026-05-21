@@ -8,25 +8,21 @@ import (
 
 	"go.temporal.io/sdk/client"
 
-	"github.com/vinodhalaharvi/sibyl/agent"
+	sibyl "github.com/vinodhalaharvi/sibyl/agent"
 )
 
-// SibylClient is the seam between loom and Sibyl. It is the only place
-// loom crosses the repo boundary into the execution engine. Defining it
-// as an interface lets the handler be tested with a fake that doesn't
-// need a running Temporal cluster.
+// PlanClient is the seam between loom and Sibyl's plan execution. It is
+// the only place loom crosses the repo boundary into the execution
+// engine. Defining it as an interface lets the handler be tested with a
+// fake that doesn't need a running Temporal cluster.
 //
-// Start begins a workflow and returns immediately with a handle (B1:
-// fire, don't block). Await blocks until the workflow identified by the
-// handle completes and returns its Answer — it is called from a
-// background goroutine, off the event-handling critical path.
-type SibylClient interface {
-	// Start submits a Question and returns a handle without waiting for
-	// the workflow to finish.
-	Start(ctx context.Context, q agent.Question) (RunHandle, error)
-	// Await blocks until the workflow for handle completes, returning
-	// its Answer.
-	Await(ctx context.Context, handle RunHandle) (agent.Answer, error)
+// Start submits a compiled Plan and returns immediately with a handle
+// (B1: fire, don't block). Await blocks until the plan's workflow
+// completes and returns its PlanResult — it is called from a background
+// goroutine, off the event-handling critical path.
+type PlanClient interface {
+	Start(ctx context.Context, plan sibyl.Plan) (RunHandle, error)
+	Await(ctx context.Context, handle RunHandle) (sibyl.PlanResult, error)
 }
 
 // RunHandle identifies a started workflow so it can be awaited later.
@@ -37,17 +33,17 @@ type RunHandle struct {
 
 // === Temporal-backed implementation ========================================
 
-// temporalSibyl is the production SibylClient. It submits ConvergeWorkflow
-// to a running Sibyl worker via a Temporal client.
-type temporalSibyl struct {
+// temporalPlanClient is the production PlanClient. It submits a Plan as a
+// Sibyl PlanWorkflow via a Temporal client.
+type temporalPlanClient struct {
 	c         client.Client
 	taskQueue string
 }
 
-// NewTemporalSibyl dials Temporal and returns a SibylClient that submits
-// to the given task queue (default: agent.TaskQueue). The caller owns
-// closing the underlying client via Close.
-func NewTemporalSibyl(hostPort, taskQueue string) (*temporalSibyl, error) {
+// NewTemporalPlanClient dials Temporal and returns a PlanClient that
+// submits to the given task queue (default: sibyl's TaskQueue). The
+// caller owns closing the underlying client via Close.
+func NewTemporalPlanClient(hostPort, taskQueue string) (*temporalPlanClient, error) {
 	opts := client.Options{}
 	if hostPort != "" {
 		opts.HostPort = hostPort
@@ -56,73 +52,61 @@ func NewTemporalSibyl(hostPort, taskQueue string) (*temporalSibyl, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loom: dial Temporal: %w", err)
 	}
-	if taskQueue == "" {
-		taskQueue = agent.TaskQueue
-	}
-	return &temporalSibyl{c: c, taskQueue: taskQueue}, nil
+	return &temporalPlanClient{c: c, taskQueue: taskQueue}, nil
 }
 
 // Close releases the Temporal client.
-func (t *temporalSibyl) Close() {
+func (t *temporalPlanClient) Close() {
 	if t.c != nil {
 		t.c.Close()
 	}
 }
 
-// Start submits ConvergeWorkflow without blocking on the result.
-func (t *temporalSibyl) Start(ctx context.Context, q agent.Question) (RunHandle, error) {
-	opts := client.StartWorkflowOptions{
-		TaskQueue: t.taskQueue,
-		ID:        fmt.Sprintf("loom-%d", time.Now().UnixNano()),
-	}
-	we, err := t.c.ExecuteWorkflow(ctx, opts, agent.ConvergeWorkflowName, q)
+// Start submits the Plan as a PlanWorkflow without blocking on the result.
+func (t *temporalPlanClient) Start(ctx context.Context, plan sibyl.Plan) (RunHandle, error) {
+	we, err := sibyl.SubmitPlan(ctx, t.c, plan, "", t.taskQueue)
 	if err != nil {
-		return RunHandle{}, fmt.Errorf("loom: start workflow: %w", err)
+		return RunHandle{}, fmt.Errorf("loom: submit plan: %w", err)
 	}
 	return RunHandle{WorkflowID: we.GetID(), RunID: we.GetRunID()}, nil
 }
 
 // Await blocks on the workflow result. Uses GetWorkflow to rebuild the
-// run handle so it works from any goroutine (not just the one that
-// started it).
-func (t *temporalSibyl) Await(ctx context.Context, h RunHandle) (agent.Answer, error) {
+// run handle so it works from any goroutine (not just the starter).
+func (t *temporalPlanClient) Await(ctx context.Context, h RunHandle) (sibyl.PlanResult, error) {
 	we := t.c.GetWorkflow(ctx, h.WorkflowID, h.RunID)
-	var ans agent.Answer
-	if err := we.Get(ctx, &ans); err != nil {
-		return agent.Answer{}, fmt.Errorf("loom: workflow %s failed: %w", h.WorkflowID, err)
+	var res sibyl.PlanResult
+	if err := we.Get(ctx, &res); err != nil {
+		return sibyl.PlanResult{}, fmt.Errorf("loom: workflow %s failed: %w", h.WorkflowID, err)
 	}
-	return ans, nil
+	return res, nil
 }
 
 // === The async runner that ties Start → Await → post together ==============
 
-// runner submits a question and arranges for the answer to be posted back
-// to the originating thread when the workflow completes. This is the B1
-// flow: Start returns fast (so the worker-pool slot frees), the
-// correlation table records the run, and a detached goroutine Awaits and
-// posts. The detached goroutine is not bounded by the handler pool —
-// it's mostly blocked on I/O waiting for Temporal, not doing work.
+// runner submits a plan and arranges for the result to be posted back to
+// the originating thread when the workflow completes (B1). Start returns
+// fast (the worker-pool slot frees), the correlation table records the
+// run, and a detached goroutine Awaits and posts.
 type runner struct {
-	sibyl    SibylClient
+	plans    PlanClient
 	corr     *Correlation
 	renderer *renderer
-	// awaitTimeout caps how long a background Await waits before giving
-	// up and posting a timeout message. 0 means no timeout.
+	// awaitTimeout caps how long a background Await waits. 0 = no timeout.
 	awaitTimeout time.Duration
 }
 
-// submit starts the workflow for an event and spawns the background
-// await+post. It returns the immediate Reply to send now (an
-// acknowledgement); the real answer arrives later via the goroutine.
-func (r *runner) submit(ctx context.Context, e Event, q agent.Question) (Reply, error) {
-	handle, err := r.sibyl.Start(ctx, q)
+// submit starts the plan for an event and spawns the background
+// await+post. It returns the immediate acknowledgement Reply.
+func (r *runner) submit(ctx context.Context, e Event, plan sibyl.Plan) (Reply, error) {
+	handle, err := r.plans.Start(ctx, plan)
 	if err != nil {
 		return Reply{}, err
 	}
 
 	thread := e.Context.Thread
 	if thread == "" {
-		thread = e.Timestamp // start a thread on the triggering message
+		thread = e.Timestamp
 	}
 	run := &Run{
 		WorkflowID: handle.WorkflowID,
@@ -134,12 +118,8 @@ func (r *runner) submit(ctx context.Context, e Event, q agent.Question) (Reply, 
 	}
 	r.corr.Put(run)
 
-	// Background await + post. Detached from ctx so a per-event
-	// cancellation doesn't kill an in-flight workflow wait; uses its own
-	// timeout instead.
-	go r.awaitAndPost(run, e)
+	go r.awaitAndPost(run)
 
-	// Immediate acknowledgement. The answer follows asynchronously.
 	return Reply{
 		Target: TargetSameThread,
 		React:  []string{"eyes"},
@@ -149,7 +129,7 @@ func (r *runner) submit(ctx context.Context, e Event, q agent.Question) (Reply, 
 
 // awaitAndPost blocks on the workflow result and posts it back to the
 // originating thread, then clears the correlation entry.
-func (r *runner) awaitAndPost(run *Run, e Event) {
+func (r *runner) awaitAndPost(run *Run) {
 	defer r.corr.Delete(run.Channel, run.Thread)
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -164,17 +144,10 @@ func (r *runner) awaitAndPost(run *Run, e Event) {
 		defer cancel()
 	}
 
-	ans, err := r.sibyl.Await(ctx, RunHandle{WorkflowID: run.WorkflowID, RunID: run.RunID})
+	res, err := r.plans.Await(ctx, RunHandle{WorkflowID: run.WorkflowID, RunID: run.RunID})
 
-	// Build the reply that posts into the originating thread. We post to
-	// the recorded channel/thread regardless of the original event's
-	// shape, so use a synthetic Event carrying that target.
 	postEvent := Event{
-		Context: Context{
-			Channel: run.Channel,
-			User:    run.User,
-			Thread:  run.Thread,
-		},
+		Context:   Context{Channel: run.Channel, User: run.User, Thread: run.Thread},
 		Timestamp: run.Thread,
 	}
 
@@ -183,10 +156,32 @@ func (r *runner) awaitAndPost(run *Run, e Event) {
 		log.Printf("loom: workflow %s error: %v", run.WorkflowID, err)
 		reply = Reply{Target: TargetSameThread, Text: "⚠️ The run failed: " + err.Error()}
 	} else {
-		reply = Reply{Target: TargetSameThread, Text: ans.Text}
+		reply = Reply{Target: TargetSameThread, Text: planResultText(res)}
 	}
 
 	if perr := r.renderer.render(ctx, postEvent, reply); perr != nil {
 		log.Printf("loom: posting result for %s: %v", run.WorkflowID, perr)
 	}
+}
+
+// planResultText renders a PlanResult for Slack: the output(s) of the
+// leaf node(s) — the pipeline's final result.
+func planResultText(res sibyl.PlanResult) string {
+	if len(res.Leaves) == 0 {
+		return "(no output)"
+	}
+	var parts []string
+	for _, leaf := range res.Leaves {
+		if out := res.Outputs[leaf]; out != "" {
+			parts = append(parts, out)
+		}
+	}
+	if len(parts) == 0 {
+		return "(empty output)"
+	}
+	text := parts[0]
+	for _, p := range parts[1:] {
+		text += "\n" + p
+	}
+	return text
 }
