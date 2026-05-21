@@ -1,0 +1,16 @@
+# Binaries
+/loom
+*.exe
+
+# Env / secrets
+.env
+*.token
+
+# Logs
+*.log
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+.DS_Store
