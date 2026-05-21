@@ -14,6 +14,19 @@ type renderer struct {
 	api *slack.Client
 }
 
+// Renderer is the exported handle for posting Replies to Slack, used by
+// asynchronous result delivery (B1) where a background goroutine posts a
+// workflow's answer back to its thread. Build one with NewRenderer from
+// the same bot token the Listener uses.
+type Renderer = renderer
+
+// NewRenderer builds a Renderer from a bot token. The async runner uses
+// it to post results; it shares the same Slack Web API surface the
+// Listener renders with.
+func NewRenderer(botToken string) *Renderer {
+	return &renderer{api: slack.New(botToken)}
+}
+
 // render posts the Reply for a given triggering Event. It applies any
 // reactions first (they attach to the triggering message), then posts
 // text/files to the chosen target.
