@@ -131,12 +131,11 @@ loom/
 ├── translate.go        # Slack event → loom.Event (the ingress half)
 ├── listener.go         # Socket Mode connection, ack, bounded dispatch
 ├── render.go           # Reply → Slack API calls (the one effectful edge)
-├── translator.go       # prose → AgentScript DSL (LLM) + conservative prompt
 ├── correlation.go      # ThreadID ↔ WorkflowID table (B1)
 ├── sibyl.go            # PlanClient seam: Start / Await + async runner
-├── sibyl_handler.go    # ScriptHandler: prose → compile → submit
+├── sibyl_handler.go    # ScriptHandler: prose → script.Translate → compile → submit
 ├── handler.go          # EchoHandler (PR-1; kept for reference/testing)
-└── *_test.go           # translate / translator / handler / correlation tests
+└── *_test.go           # handler (incl. safety-net) / correlation tests
 ```
 
 ## Roadmap

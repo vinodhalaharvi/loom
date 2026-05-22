@@ -4,7 +4,7 @@
 // The pipeline (PR-3):
 //
 //	Slack message (prose)
-//	  → Translator (LLM) emits AgentScript DSL
+//	  → script.Translate (LLM) emits AgentScript DSL
 //	  → script.Compile validates it (rejects unknown/bad commands safely)
 //	  → script.Submit runs it as a durable Sibyl PlanWorkflow
 //	  → the result is posted back to the thread (B1 correlation)
@@ -58,9 +58,10 @@ func main() {
 
 	// The builtin registry drives both the translator's prompt (which
 	// commands the LLM may use) and compilation (which it validates
-	// against). One registry, one source of truth.
+	// against). One registry, one source of truth. The prose→DSL prompt
+	// itself lives in AgentScript (script.Translate); loom only supplies
+	// the LLM and registry.
 	reg := script.DefaultRegistry()
-	translator := loom.NewTranslator(llm.Complete, reg)
 
 	// Sibyl execution seam.
 	plans, err := loom.NewTemporalPlanClient(
@@ -76,7 +77,8 @@ func main() {
 	renderer := loom.NewRenderer(botToken)
 
 	handler := loom.NewScriptHandler(loom.ScriptHandlerConfig{
-		Translator:  translator,
+		Complete:    llm.Complete,
+		Registry:    reg,
 		Plans:       plans,
 		Correlation: corr,
 		Renderer:    renderer,

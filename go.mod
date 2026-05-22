@@ -4,7 +4,7 @@ go 1.25
 
 require (
 	github.com/slack-go/slack v0.23.1
-	github.com/vinodhalaharvi/agentscript v0.1.1-0.20260521104056-62bc0a7fc358
+	github.com/vinodhalaharvi/agentscript v0.1.1-0.20260522190441-231df9afb184
 	github.com/vinodhalaharvi/sibyl v0.1.1-0.20260521024214-bfa4bcb5ee5f
 	go.temporal.io/sdk v1.41.1
 )
