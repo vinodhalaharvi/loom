@@ -31,6 +31,11 @@ func NewRenderer(botToken string) *Renderer {
 // reactions first (they attach to the triggering message), then posts
 // text/files to the chosen target.
 func (r *renderer) render(ctx context.Context, e Event, reply Reply) error {
+	if r == nil || r.api == nil {
+		// No Slack client configured (e.g. in tests, or a renderer built
+		// without a token). Nothing to post; not an error.
+		return nil
+	}
 	// Reactions attach to the message that triggered the event.
 	for _, name := range reply.React {
 		if e.Context.Channel == "" || e.Timestamp == "" {

@@ -98,54 +98,25 @@ func (f *fakePlans) startedCount() int {
 
 // stubLLM returns a CompleteFunc that always yields the given DSL,
 // ignoring the prompt. Lets us test the handler without a real LLM.
-func stubLLM(dsl string) CompleteFunc {
+func stubLLM(dsl string) script.CompleteFunc {
 	return func(_ context.Context, _, _ string) (string, error) {
 		return dsl, nil
 	}
 }
 
-func newTestScriptHandler(t *testing.T, llm CompleteFunc, plans PlanClient) (*ScriptHandler, *Correlation) {
+func newTestScriptHandler(t *testing.T, llm script.CompleteFunc, plans PlanClient) (*ScriptHandler, *Correlation) {
 	t.Helper()
 	corr := NewCorrelation()
 	reg := script.DefaultRegistry()
 	h := NewScriptHandler(ScriptHandlerConfig{
-		Translator:   NewTranslator(llm, reg),
+		Complete:     llm,
+		Registry:     reg,
 		Plans:        plans,
 		Correlation:  corr,
 		Renderer:     &renderer{api: nil},
 		AwaitTimeout: time.Second,
 	})
 	return h, corr
-}
-
-// === Translator ============================================================
-
-func TestTranslator_CleansFences(t *testing.T) {
-	llm := stubLLM("```\ntemporal static ( echo \"hi\" )\n```")
-	tr := NewTranslator(llm, script.DefaultRegistry())
-	dsl, err := tr.ToDSL(context.Background(), "say hi")
-	if err != nil {
-		t.Fatalf("ToDSL: %v", err)
-	}
-	if strings.Contains(dsl, "```") {
-		t.Errorf("fences not stripped: %q", dsl)
-	}
-	if !strings.HasPrefix(dsl, "temporal static") {
-		t.Errorf("DSL = %q, want it to start with the block", dsl)
-	}
-}
-
-func TestTranslator_SystemPromptListsBuiltins(t *testing.T) {
-	var capturedSystem string
-	llm := func(_ context.Context, system, _ string) (string, error) {
-		capturedSystem = system
-		return `temporal static ( echo "x" )`, nil
-	}
-	tr := NewTranslator(llm, script.DefaultRegistry())
-	_, _ = tr.ToDSL(context.Background(), "anything")
-	if !strings.Contains(capturedSystem, "echo") {
-		t.Error("system prompt should list the echo builtin")
-	}
 }
 
 // === ScriptHandler: happy path ============================================
