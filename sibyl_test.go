@@ -107,10 +107,9 @@ func stubLLM(dsl string) script.CompleteFunc {
 func newTestScriptHandler(t *testing.T, llm script.CompleteFunc, plans PlanClient) (*ScriptHandler, *Correlation) {
 	t.Helper()
 	corr := NewCorrelation()
-	reg := script.DefaultRegistry()
 	h := NewScriptHandler(ScriptHandlerConfig{
 		Complete:     llm,
-		Registry:     reg,
+		Grammar:      script.Grammar(),
 		Plans:        plans,
 		Correlation:  corr,
 		Renderer:     &renderer{api: nil},
@@ -209,6 +208,35 @@ func TestScriptHandler_RejectsUnknownCommand(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(reply.Text), "couldn't") {
 		t.Errorf("expected a friendly rejection, got %q", reply.Text)
+	}
+}
+
+// With discovery, loom advertises the full vocabulary, so the LLM may
+// legitimately emit a historical verb like hf_summarize. On the temporal
+// backend that verb isn't implemented yet — loom must reject it with an
+// HONEST "known but not on this backend" reply, and submit NOTHING. This
+// is the behavior the complete-registry + discovery work unlocks: the
+// failure is honest, not a misleading "unknown command".
+func TestScriptHandler_KnownVerbNotOnBackend_NoSubmit(t *testing.T) {
+	f := &fakePlans{}
+	llm := stubLLM(`temporal static ( hf_summarize "the thread" )`)
+	h, _ := newTestScriptHandler(t, llm, f)
+
+	reply, err := h.Handle(context.Background(), Event{
+		Kind: KindMention, Text: "summarize the thread",
+		Context: Context{Channel: "C1"}, Timestamp: "1.0",
+	})
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if f.startedCount() != 0 {
+		t.Fatal("a known-but-unavailable verb must not submit anything")
+	}
+	if len(reply.React) == 0 || reply.React[0] != "warning" {
+		t.Errorf("expected a warning reaction, got %+v", reply)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "backend") {
+		t.Errorf("expected an honest not-on-this-backend message, got %q", reply.Text)
 	}
 }
 

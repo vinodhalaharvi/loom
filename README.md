@@ -133,7 +133,7 @@ loom/
 ├── render.go           # Reply → Slack API calls (the one effectful edge)
 ├── correlation.go      # ThreadID ↔ WorkflowID table (B1)
 ├── sibyl.go            # PlanClient seam: Start / Await + async runner
-├── sibyl_handler.go    # ScriptHandler: prose → script.Translate → compile → submit
+├── sibyl_handler.go    # ScriptHandler: prose → script.TranslateGrammar → CompileGrammar → submit (discovery-driven)
 ├── handler.go          # EchoHandler (PR-1; kept for reference/testing)
 └── *_test.go           # handler (incl. safety-net) / correlation tests
 ```
