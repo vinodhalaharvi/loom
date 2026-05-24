@@ -56,12 +56,11 @@ func main() {
 		log.Fatalf("loom: LLM setup: %v (set ANTHROPIC_API_KEY)", err)
 	}
 
-	// The builtin registry drives both the translator's prompt (which
-	// commands the LLM may use) and compilation (which it validates
-	// against). One registry, one source of truth. The prose→DSL prompt
-	// itself lives in AgentScript (script.Translate); loom only supplies
-	// the LLM and registry.
-	reg := script.DefaultRegistry()
+	// Discovery: ask AgentScript what can be done. loom passes this
+	// through opaquely — it never inspects the contents, names a
+	// registry, or carries a verb list. When AgentScript's grammar grows,
+	// loom reflects it automatically.
+	grammar := script.Grammar()
 
 	// Sibyl execution seam.
 	plans, err := loom.NewTemporalPlanClient(
@@ -78,7 +77,7 @@ func main() {
 
 	handler := loom.NewScriptHandler(loom.ScriptHandlerConfig{
 		Complete:    llm.Complete,
-		Registry:    reg,
+		Grammar:     grammar,
 		Plans:       plans,
 		Correlation: corr,
 		Renderer:    renderer,

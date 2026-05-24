@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/vinodhalaharvi/agentscript/pkg/script"
-	"github.com/vinodhalaharvi/agentscript/pkg/script/registry"
 )
 
 // ScriptHandler is loom's main Handler: it turns a Slack message into an
@@ -16,18 +15,19 @@ import (
 // Plan, and submits it. The answer is posted back to the thread
 // asynchronously by the runner (B1).
 //
-// loom carries NO grammar knowledge. The prose→DSL step and the grammar
-// prompt live in AgentScript's pkg/script (script.Translate), next to the
-// grammar and registry they must stay in sync with. loom only supplies
-// the LLM and the registry, then leans on the compiler as the safety net:
-// if the LLM emits an unknown command or bad arity, script.Compile fails
-// with a typed error and loom replies with a friendly message — nothing
-// wrong ever executes.
+// loom carries NO grammar knowledge. It calls script.Grammar() once at
+// startup and passes the resulting GrammarInfo through opaquely — it
+// never inspects the contents, names a registry, or carries a verb list.
+// AgentScript owns the grammar, the prose→DSL prompt, and validation;
+// when AgentScript's grammar grows, loom reflects it automatically. loom
+// leans on the compiler as the safety net: an unknown command, bad arity,
+// or a verb not available on the chosen backend fails at compile, and
+// loom replies with a friendly message — nothing wrong ever executes.
 //
-//	prose → script.Translate (LLM) → DSL → script.Compile → Plan → submit
+//	prose → script.TranslateGrammar (LLM) → DSL → script.CompileGrammar → Plan → submit
 type ScriptHandler struct {
 	complete script.CompleteFunc
-	reg      *registry.Registry
+	grammar  script.GrammarInfo
 	runner   *runner
 }
 
@@ -35,9 +35,10 @@ type ScriptHandler struct {
 type ScriptHandlerConfig struct {
 	// Complete is the LLM used for prose→DSL translation. Required.
 	Complete script.CompleteFunc
-	// Registry supplies the builtins the translator may use and the
-	// compiler validates against — one source of truth. Required.
-	Registry *registry.Registry
+	// Grammar is the discovery result from script.Grammar(). loom passes
+	// it through opaquely — it never inspects the contents, names a
+	// registry, or carries a verb list. Required.
+	Grammar script.GrammarInfo
 	// Plans is the execution seam (submit/await Plans). Required.
 	Plans PlanClient
 	// Correlation tracks thread↔workflow. Required.
@@ -52,7 +53,7 @@ type ScriptHandlerConfig struct {
 func NewScriptHandler(cfg ScriptHandlerConfig) *ScriptHandler {
 	return &ScriptHandler{
 		complete: cfg.Complete,
-		reg:      cfg.Registry,
+		grammar:  cfg.Grammar,
 		runner: &runner{
 			plans:        cfg.Plans,
 			corr:         cfg.Correlation,
@@ -79,8 +80,10 @@ func (h *ScriptHandler) Handle(ctx context.Context, e Event) (Reply, error) {
 }
 
 func (h *ScriptHandler) handleProse(ctx context.Context, e Event, prose string) (Reply, error) {
-	// prose → DSL (AgentScript owns the grammar prompt + LLM call).
-	src, err := script.Translate(ctx, h.complete, h.reg, prose)
+	// prose → DSL. AgentScript owns the grammar prompt and the verb
+	// vocabulary; loom passes its discovery handle (h.grammar) straight
+	// through without inspecting it.
+	src, err := script.TranslateGrammar(ctx, h.complete, h.grammar, prose)
 	if err != nil {
 		// LLM/translation failure (network, no key, etc.).
 		log.Printf("loom: translate failed: %v", err)
@@ -91,10 +94,11 @@ func (h *ScriptHandler) handleProse(ctx context.Context, e Event, prose string) 
 	}
 
 	// DSL → validated Plan. The compiler is the safety net.
-	plan, err := script.Compile(ctx, h.reg, src)
+	plan, err := script.CompileGrammar(ctx, h.grammar, src)
 	if err != nil {
 		// The LLM emitted DSL that doesn't compile — unknown command,
-		// bad arity, malformed graph. Nothing executes; tell the user.
+		// bad arity, a verb not available on this backend yet, or a
+		// malformed graph. Nothing executes; tell the user.
 		log.Printf("loom: compile rejected DSL %q: %v", string(src), err)
 		return Reply{
 			Target: TargetSameThread,
@@ -116,6 +120,10 @@ func friendlyCompileError(err error) string {
 			return "I can do: " + strings.Join(unknown.Known, ", ") + "."
 		}
 		return "That command isn't available."
+	}
+	var notImpl *script.NotImplementedOnBackendError
+	if errors.As(err, &notImpl) {
+		return "That's a known action but it isn't available on this backend yet."
 	}
 	var arity *script.ArityError
 	if errors.As(err, &arity) {
