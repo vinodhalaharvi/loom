@@ -38,6 +38,7 @@ import (
 	sibyl "github.com/vinodhalaharvi/sibyl/agent"
 
 	"github.com/vinodhalaharvi/agentscript/pkg/script"
+	"github.com/vinodhalaharvi/agentscript/pkg/scriptmem"
 
 	"github.com/vinodhalaharvi/loom"
 )
@@ -75,12 +76,23 @@ func main() {
 	corr := loom.NewCorrelation()
 	renderer := loom.NewRenderer(botToken)
 
+	// Memory-backend execution config: the in-process runtime reads these
+	// for verbs that need credentials. All optional — a memory verb that
+	// needs a key it doesn't get fails at execution with a friendly note.
+	memCfg := scriptmem.MemoryConfig{
+		GeminiAPIKey: os.Getenv("GEMINI_API_KEY"),
+		ClaudeAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
+		SearchAPIKey: os.Getenv("SEARCH_API_KEY"),
+		Model:        os.Getenv("AGENTSCRIPT_MODEL"),
+	}
+
 	handler := loom.NewScriptHandler(loom.ScriptHandlerConfig{
-		Complete:    llm.Complete,
-		Grammar:     grammar,
-		Plans:       plans,
-		Correlation: corr,
-		Renderer:    renderer,
+		Complete:     llm.Complete,
+		Grammar:      grammar,
+		MemoryConfig: memCfg,
+		Plans:        plans,
+		Correlation:  corr,
+		Renderer:     renderer,
 	})
 
 	listener, err := loom.NewListener(loom.Options{

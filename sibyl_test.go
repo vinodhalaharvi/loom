@@ -127,7 +127,6 @@ func TestScriptHandler_MentionCompilesAndSubmits(t *testing.T) {
 	}}
 	llm := stubLLM(`temporal static ( echo "hello" )`)
 	h, corr := newTestScriptHandler(t, llm, f)
-
 	reply, err := h.Handle(context.Background(), Event{
 		Kind:      KindMention,
 		Text:      "say hello",
@@ -217,6 +216,40 @@ func TestScriptHandler_RejectsUnknownCommand(t *testing.T) {
 // HONEST "known but not on this backend" reply, and submit NOTHING. This
 // is the behavior the complete-registry + discovery work unlocks: the
 // failure is honest, not a misleading "unknown command".
+// A memory-backend program must route to in-process execution, NOT to a
+// temporal submission. loom posts the result directly; no plan is started
+// and no correlation is recorded. (We use a memory verb that fails fast
+// without credentials — the routing is the assertion: zero temporal
+// submits, and the reply is synchronous, not a "working on it…" ack.)
+func TestScriptHandler_MemoryRoutesNoSubmit(t *testing.T) {
+	f := &fakePlans{}
+	llm := stubLLM(`memory static ( hf_summarize "the thread" )`)
+	h, corr := newTestScriptHandler(t, llm, f)
+
+	reply, err := h.Handle(context.Background(), Event{
+		Kind: KindMention, Text: "summarize in memory",
+		Context: Context{Channel: "C1", User: "U1"}, Timestamp: "100.0",
+	})
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	// Memory must never submit a temporal plan or correlate a workflow.
+	if f.startedCount() != 0 {
+		t.Errorf("memory program must not submit a temporal plan; started %d", f.startedCount())
+	}
+	if _, ok := corr.Get("C1", "100.0"); ok {
+		t.Error("memory program must not record a temporal correlation")
+	}
+	// The reply must NOT be the temporal "working on it…" ack with an
+	// eyes reaction — memory replies synchronously (with the result, or a
+	// friendly error if the verb needs credentials we didn't supply).
+	for _, r := range reply.React {
+		if r == "eyes" {
+			t.Error("memory reply should be synchronous, not the temporal ack")
+		}
+	}
+}
+
 func TestScriptHandler_KnownVerbNotOnBackend_NoSubmit(t *testing.T) {
 	f := &fakePlans{}
 	llm := stubLLM(`temporal static ( hf_summarize "the thread" )`)
