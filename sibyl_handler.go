@@ -8,26 +8,31 @@ import (
 	"time"
 
 	"github.com/vinodhalaharvi/agentscript/pkg/script"
+	"github.com/vinodhalaharvi/agentscript/pkg/scriptmem"
 )
 
 // ScriptHandler is loom's main Handler: it turns a Slack message into an
-// AgentScript program (via an LLM), compiles that program to a Sibyl
-// Plan, and submits it. The answer is posted back to the thread
-// asynchronously by the runner (B1).
+// AgentScript program (via an LLM) and runs it through the unified
+// execution entry. The backend the program targets (memory | temporal)
+// is chosen by the DSL the LLM emits, and decides the delivery shape:
 //
-// loom carries NO grammar knowledge. It calls script.Grammar() once at
-// startup and passes the resulting GrammarInfo through opaquely — it
-// never inspects the contents, names a registry, or carries a verb list.
-// AgentScript owns the grammar, the prose→DSL prompt, and validation;
-// when AgentScript's grammar grows, loom reflects it automatically. loom
-// leans on the compiler as the safety net: an unknown command, bad arity,
-// or a verb not available on the chosen backend fails at compile, and
-// loom replies with a friendly message — nothing wrong ever executes.
+//   - memory   → the program ran in-process; the result is ready now, so
+//     loom posts it immediately (a synchronous reply).
+//   - temporal → the program compiled to a durable plan; loom submits it,
+//     records the thread↔workflow correlation, and posts the result when
+//     the workflow completes (the B1 async path).
 //
-//	prose → script.TranslateGrammar (LLM) → DSL → script.CompileGrammar → Plan → submit
+// loom carries NO grammar knowledge. It calls script.Grammar() once and
+// passes the GrammarInfo through opaquely; AgentScript owns translation,
+// resolution, backend selection, and (for memory) execution. loom only
+// learns the execution *shape* (sync vs async) — never the grammar — and
+// branches on it to choose how to deliver the answer.
+//
+//	prose → scriptmem.Execute → Outcome{ memory: Result | temporal: Plan }
 type ScriptHandler struct {
 	complete script.CompleteFunc
 	grammar  script.GrammarInfo
+	memCfg   scriptmem.MemoryConfig
 	runner   *runner
 }
 
@@ -39,13 +44,18 @@ type ScriptHandlerConfig struct {
 	// it through opaquely — it never inspects the contents, names a
 	// registry, or carries a verb list. Required.
 	Grammar script.GrammarInfo
-	// Plans is the execution seam (submit/await Plans). Required.
+	// MemoryConfig configures the in-process runtime for memory-backend
+	// execution (API keys, etc.). Optional — a verb that needs a
+	// credential it doesn't supply fails at execution.
+	MemoryConfig scriptmem.MemoryConfig
+	// Plans is the execution seam for the temporal backend. Required.
 	Plans PlanClient
-	// Correlation tracks thread↔workflow. Required.
+	// Correlation tracks thread↔workflow for temporal runs. Required.
 	Correlation *Correlation
 	// Renderer posts the async result. Required.
 	Renderer *renderer
-	// AwaitTimeout caps how long the background wait blocks. 0 = none.
+	// AwaitTimeout caps how long a temporal background wait blocks.
+	// 0 = none.
 	AwaitTimeout time.Duration
 }
 
@@ -54,6 +64,7 @@ func NewScriptHandler(cfg ScriptHandlerConfig) *ScriptHandler {
 	return &ScriptHandler{
 		complete: cfg.Complete,
 		grammar:  cfg.Grammar,
+		memCfg:   cfg.MemoryConfig,
 		runner: &runner{
 			plans:        cfg.Plans,
 			corr:         cfg.Correlation,
@@ -63,9 +74,8 @@ func NewScriptHandler(cfg ScriptHandlerConfig) *ScriptHandler {
 	}
 }
 
-// Handle is the Handler. It compiles the message text into a Plan and
-// submits it. Only mentions, messages, and slash commands carry a
-// request; other event kinds are ignored.
+// Handle is the Handler. Only mentions, messages, and slash commands
+// carry a request; other event kinds are ignored.
 func (h *ScriptHandler) Handle(ctx context.Context, e Event) (Reply, error) {
 	switch e.Kind {
 	case KindMention, KindMessage, KindSlashCommand:
@@ -80,35 +90,65 @@ func (h *ScriptHandler) Handle(ctx context.Context, e Event) (Reply, error) {
 }
 
 func (h *ScriptHandler) handleProse(ctx context.Context, e Event, prose string) (Reply, error) {
-	// prose → DSL. AgentScript owns the grammar prompt and the verb
-	// vocabulary; loom passes its discovery handle (h.grammar) straight
-	// through without inspecting it.
-	src, err := script.TranslateGrammar(ctx, h.complete, h.grammar, prose)
+	// One call: translate → resolve → route on backend → run (memory) or
+	// compile to a plan (temporal). loom never inspects the grammar.
+	outcome, err := scriptmem.Execute(ctx, h.complete, h.grammar, h.memCfg, prose)
 	if err != nil {
-		// LLM/translation failure (network, no key, etc.).
-		log.Printf("loom: translate failed: %v", err)
-		return Reply{
-			Target: TargetSameThread,
-			Text:   "⚠️ I couldn't reach the translator. Try again in a moment.",
-		}, nil
+		return h.replyForError(err), nil
 	}
 
-	// DSL → validated Plan. The compiler is the safety net.
-	plan, err := script.CompileGrammar(ctx, h.grammar, src)
-	if err != nil {
-		// The LLM emitted DSL that doesn't compile — unknown command,
-		// bad arity, a verb not available on this backend yet, or a
-		// malformed graph. Nothing executes; tell the user.
-		log.Printf("loom: compile rejected DSL %q: %v", string(src), err)
+	switch outcome.Backend {
+	case scriptmem.Memory:
+		// Already ran in-process; the result is ready. Post it now.
+		return Reply{
+			Target: TargetSameThread,
+			Text:   memoryResultText(outcome.Result),
+		}, nil
+
+	case scriptmem.Temporal:
+		// Durable plan: submit + correlate + background await + post later.
+		return h.runner.submit(ctx, e, outcome.Plan)
+
+	default:
+		log.Printf("loom: unexpected backend %v", outcome.Backend)
+		return Reply{
+			Target: TargetSameThread,
+			Text:   "⚠️ I couldn't figure out how to run that.",
+		}, nil
+	}
+}
+
+// replyForError turns an Execute error into a friendly Slack reply. It
+// distinguishes the translator being unreachable (LLM failure) from the
+// compiler/safety-net rejecting the program (unknown verb, wrong backend,
+// bad arity). In every case nothing ran, so we just explain kindly.
+func (h *ScriptHandler) replyForError(err error) Reply {
+	// Translation/LLM reachability: a bare error from the LLM seam.
+	var unknown *script.UnknownBuiltinError
+	var notImpl *script.NotImplementedOnBackendError
+	var arity *script.ArityError
+	if errors.As(err, &unknown) || errors.As(err, &notImpl) || errors.As(err, &arity) {
+		log.Printf("loom: program rejected: %v", err)
 		return Reply{
 			Target: TargetSameThread,
 			React:  []string{"warning"},
 			Text:   "I couldn't turn that into a valid command. " + friendlyCompileError(err),
-		}, nil
+		}
 	}
+	// Otherwise treat it as an upstream/translator failure.
+	log.Printf("loom: execute failed: %v", err)
+	return Reply{
+		Target: TargetSameThread,
+		Text:   "⚠️ I couldn't reach the translator. Try again in a moment.",
+	}
+}
 
-	// Validated plan → submit + correlate + background await.
-	return h.runner.submit(ctx, e, plan)
+// memoryResultText renders an in-process result for Slack.
+func memoryResultText(result string) string {
+	if strings.TrimSpace(result) == "" {
+		return "(no output)"
+	}
+	return result
 }
 
 // friendlyCompileError turns a compiler error into a short,
