@@ -85,6 +85,11 @@ func main() {
 	// for verbs that need credentials. All optional — a memory verb that
 	// needs a key it doesn't get fails at execution with a friendly note.
 	memCfg := scriptmem.MemoryConfig{
+		// Memory-backend verbs (summarize/ask/analyze/search) default to
+		// Claude Code — no API key, consistent with the rest of loom.
+		// Gemini stays available if GEMINI_API_KEY is set and a prompt
+		// explicitly selects it.
+		LLMBackend:   "claude-code",
 		GeminiAPIKey: os.Getenv("GEMINI_API_KEY"),
 		ClaudeAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
 		SearchAPIKey: os.Getenv("SEARCH_API_KEY"),

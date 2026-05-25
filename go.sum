@@ -125,8 +125,8 @@ github.com/stretchr/testify v1.8.0/go.mod h1:yNjHg4UonilssWZ8iaSj1OCr/vHnekPRkoO
 github.com/stretchr/testify v1.8.1/go.mod h1:w2LPCIKwWwSfY2zedu0+kehJoqGctiVI29o6fzry7u4=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
-github.com/vinodhalaharvi/agentscript v0.1.1-0.20260524134602-24e7df446dbc h1:nsTsHqXQgU3Ldyzjy2sxb+XHXkwJ+labPmMrypahfpE=
-github.com/vinodhalaharvi/agentscript v0.1.1-0.20260524134602-24e7df446dbc/go.mod h1:ZUt46xoa4FFz/ZcJePer6Vuh/kgXiUVN5iBY9RfLUi8=
+github.com/vinodhalaharvi/agentscript v0.1.1-0.20260525135315-ff5b4b810fa8 h1:077K6DKhLRDqog9Klo4Qx6t8AJDxK8MLb7a8nqFp6Wo=
+github.com/vinodhalaharvi/agentscript v0.1.1-0.20260525135315-ff5b4b810fa8/go.mod h1:ZUt46xoa4FFz/ZcJePer6Vuh/kgXiUVN5iBY9RfLUi8=
 github.com/vinodhalaharvi/sibyl v0.1.1-0.20260521024214-bfa4bcb5ee5f h1:Gk/HTU8B9S41cK7SrJmR3Fs4OhKL/4dnvNWKWLd56Qc=
 github.com/vinodhalaharvi/sibyl v0.1.1-0.20260521024214-bfa4bcb5ee5f/go.mod h1:mKahDLeIvFX/tHqSUGwcLOo1R/Io54357LTxnEBH25k=
 github.com/vinodhalaharvi/weft v0.1.0 h1:9Q6/qa2NsVVbPqloFNyHttl6yK3pMXIhpZ5tozUF7Mc=

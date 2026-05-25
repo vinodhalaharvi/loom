@@ -90,6 +90,16 @@ func (h *ScriptHandler) Handle(ctx context.Context, e Event) (Reply, error) {
 }
 
 func (h *ScriptHandler) handleProse(ctx context.Context, e Event, prose string) (Reply, error) {
+	// Debug visibility: log the DSL the LLM emits, so backend selection
+	// (memory vs temporal) is observable. This is a separate translate
+	// call used only for logging; Execute translates again for the real
+	// run. Cheap insurance against blind backend-routing bugs.
+	if dsl, terr := script.TranslateGrammar(ctx, h.complete, h.grammar, prose); terr == nil {
+		log.Printf("loom: prose=%q → DSL=%q", prose, string(dsl))
+	} else {
+		log.Printf("loom: translate(for-log) failed: %v", terr)
+	}
+
 	// One call: translate → resolve → route on backend → run (memory) or
 	// compile to a plan (temporal). loom never inspects the grammar.
 	outcome, err := scriptmem.Execute(ctx, h.complete, h.grammar, h.memCfg, prose)
