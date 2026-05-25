@@ -13,7 +13,8 @@
 //
 //	SLACK_BOT_TOKEN    xoxb-...   (Web API: post, react)
 //	SLACK_APP_TOKEN    xapp-...   (Socket Mode: connections:write)
-//	ANTHROPIC_API_KEY  the LLM key for prose→DSL translation
+//	LOOM_LLM           llm backend: claude-code (default) | anthropic
+//	ANTHROPIC_API_KEY  required only when LOOM_LLM=anthropic
 //
 // Optional environment:
 //
@@ -30,6 +31,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -50,11 +52,14 @@ func main() {
 		log.Fatal("loom: set SLACK_BOT_TOKEN (xoxb-) and SLACK_APP_TOKEN (xapp-)")
 	}
 
-	// LLM for prose→DSL translation. Reuses Sibyl's Anthropic client,
-	// which reads ANTHROPIC_API_KEY.
-	llm, err := sibyl.NewAnthropicClient(sibyl.AnthropicConfig{})
+	// LLM for prose→DSL translation. Default to Claude Code (the `claude`
+	// CLI as a subprocess), which uses the CLI's own local login — no API
+	// key needed. Set LOOM_LLM=anthropic to use the Messages API instead
+	// (then ANTHROPIC_API_KEY is required). Either client is just a
+	// CompleteFunc, so the handler is unchanged.
+	complete, err := pickLLM(os.Getenv("LOOM_LLM"), os.Getenv("LOOM_MODEL"))
 	if err != nil {
-		log.Fatalf("loom: LLM setup: %v (set ANTHROPIC_API_KEY)", err)
+		log.Fatalf("loom: LLM setup: %v", err)
 	}
 
 	// Discovery: ask AgentScript what can be done. loom passes this
@@ -87,7 +92,7 @@ func main() {
 	}
 
 	handler := loom.NewScriptHandler(loom.ScriptHandlerConfig{
-		Complete:     llm.Complete,
+		Complete:     complete,
 		Grammar:      grammar,
 		MemoryConfig: memCfg,
 		Plans:        plans,
@@ -113,4 +118,25 @@ func main() {
 		log.Fatalf("loom: listener stopped: %v", err)
 	}
 	log.Println("loom: shut down")
+}
+
+// pickLLM selects the prose→DSL completion backend. It defaults to Claude
+// Code (the `claude` CLI subprocess, authenticated by the CLI's own local
+// login — no API key). LOOM_LLM=anthropic switches to the Messages API
+// (requires ANTHROPIC_API_KEY). Both return a CompleteFunc, so the rest
+// of loom is identical regardless of choice.
+func pickLLM(kind, model string) (script.CompleteFunc, error) {
+	switch kind {
+	case "", "claude-code", "claudecode":
+		c := sibyl.NewClaudeCodeClient(sibyl.ClaudeCodeConfig{Model: model})
+		return c.Complete, nil
+	case "anthropic":
+		c, err := sibyl.NewAnthropicClient(sibyl.AnthropicConfig{})
+		if err != nil {
+			return nil, fmt.Errorf("anthropic backend (set ANTHROPIC_API_KEY): %w", err)
+		}
+		return c.Complete, nil
+	default:
+		return nil, fmt.Errorf("unknown LOOM_LLM %q (use claude-code or anthropic)", kind)
+	}
 }
