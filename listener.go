@@ -94,8 +94,18 @@ func (l *Listener) Run(ctx context.Context) error {
 }
 
 // readLoop is the single reader of the Socket Mode event channel. It acks
-// each request-bearing event immediately, then dispatches handling to the
+// each acknowledgeable event immediately, then dispatches handling to the
 // bounded worker pool. Reading and acking never wait on handler work.
+//
+// CRITICAL: only data events (EventsAPI, SlashCommand, Interactive) may be
+// acked. Lifecycle frames — hello, connecting, connected, disconnect,
+// errors — must NOT be acked even though some (e.g. hello) carry a
+// non-nil Request. Acking a hello sends a Socket Mode response with an
+// empty envelope ID, which Slack rejects by closing the connection
+// (1006 abnormal closure). That produced an endless connect → hello →
+// ack → 1006 → reconnect loop in which no real events were ever
+// delivered. Gating the ack on the event TYPE (not just Request != nil)
+// is the fix.
 func (l *Listener) readLoop(ctx context.Context) {
 	for {
 		select {
@@ -105,11 +115,18 @@ func (l *Listener) readLoop(ctx context.Context) {
 			if !ok {
 				return
 			}
-			// Ack first, within the 3s window, regardless of what the
-			// handler will do. Events without a Request (lifecycle
-			// events) carry no ack.
-			if evt.Request != nil {
-				l.sm.Ack(*evt.Request)
+
+			// Ack only the acknowledgeable data-event types. Everything
+			// else (hello/connecting/connected/disconnect/errors) is a
+			// lifecycle frame and must not be acked.
+			if ackable(evt.Type) {
+				if evt.Request != nil {
+					l.sm.Ack(*evt.Request)
+				}
+			} else {
+				// Lifecycle frame: never ack, never dispatch as a user
+				// event.
+				continue
 			}
 
 			loomEvt, handled := translate(evt, l.botID)
@@ -118,6 +135,24 @@ func (l *Listener) readLoop(ctx context.Context) {
 			}
 			l.dispatch(ctx, loomEvt)
 		}
+	}
+}
+
+// ackable reports whether a Socket Mode event type carries a request that
+// must be acknowledged. ONLY data events qualify: EventsAPI,
+// SlashCommand, Interactive. Lifecycle frames (hello, connecting,
+// connected, disconnect, errors) must never be acked — acking a hello, in
+// particular, sends a response with an empty envelope ID that Slack
+// rejects by closing the socket (1006), causing an endless reconnect
+// loop in which no events are ever delivered.
+func ackable(t socketmode.EventType) bool {
+	switch t {
+	case socketmode.EventTypeEventsAPI,
+		socketmode.EventTypeSlashCommand,
+		socketmode.EventTypeInteractive:
+		return true
+	default:
+		return false
 	}
 }
 
